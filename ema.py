@@ -41,7 +41,6 @@ class EMA:
             if p.requires_grad:
                 p.data.copy_(self.collected_backup[name].to(p.device))
         self.collected_backup = None
-
     # ---------------------------
     # Add these for saving/loading
     # ---------------------------

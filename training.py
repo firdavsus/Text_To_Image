@@ -1,124 +1,117 @@
-# minimal_laion_train.py
-import io, os, math, time, requests, random
-from PIL import Image
-import torch.nn.functional as F
-from tqdm.auto import tqdm
-import torch, torch.nn as nn, torch.optim as optim
-import torchvision.transforms.functional as TF
-from datasets import load_dataset
-from transformers import AutoTokenizer
-from itertools import islice
-from tqdm.auto import tqdm
-import matplotlib.pyplot as plt
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from model import Model, config
+import torch
+from torch import nn
+from torch.nn import functional as F
+import math
+import os
+import shutil
+from sklearn.model_selection import train_test_split
+from VAE import VAE
 from ema import EMA
+from torch.utils.data import Dataset
+import os
+import json
+from PIL import Image
+from torch.utils.data import DataLoader
 
-# ----------------- CONFIG -----------------
-class CFG:
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    img_size = config.img_size
-    batch = 1
-    steps = 10000
-    lr = 1e-4
-    T = 1000
-    log_every = 25
-    save_every = 100
-    out_dir = "samples"
-    max_len = config.max_len
-    dataset = "conceptual_captions"
-    chunk_size = 1000
-    accum_steps=1
-    epoch = 30
+# def split_dataset(source_dir, train_dir, test_dir, test_size=0.1, random_state=42):
+#     image_files = [f for f in os.listdir(source_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
 
-cfg = CFG()
-os.makedirs(cfg.out_dir, exist_ok=True)
+#     train_files, test_files = train_test_split(image_files, test_size=test_size, random_state=random_state)
 
-# ----------------- tokenizer (BPE: GPT-2) -----------------
-tok = AutoTokenizer.from_pretrained("gpt2")
-if tok.pad_token is None:
-    tok.pad_token = tok.eos_token
+#     os.makedirs(train_dir, exist_ok=True)
+#     os.makedirs(test_dir, exist_ok=True)
 
-config.vocab_size = tok.vocab_size
+#     for file in train_files:
+#         shutil.copy(os.path.join(source_dir, file), os.path.join(train_dir, file))
 
-def tokenize_batch(texts):
-    out = tok(texts, padding="max_length", truncation=True, max_length=cfg.max_len, return_tensors="pt")
-    return out["input_ids"].to(cfg.device)
+#     for file in test_files:
+#         shutil.copy(os.path.join(source_dir, file), os.path.join(test_dir, file))
 
-# ----------------- simple image fetch+prep -----------------
-def fetch_image(url, size=cfg.img_size, timeout=4):
-    try:
-        r = requests.get(url, timeout=timeout, headers={"User-Agent":"curl/7.64"})
-        r.raise_for_status()
-        im = Image.open(io.BytesIO(r.content)).convert("RGB")
-        # center-crop square then resize
-        W,H = im.size; m = min(W,H)
-        im = im.crop(((W-m)//2, (H-m)//2, (W+m)//2, (H+m)//2)).resize((size,size), Image.BICUBIC)
-        t = TF.to_tensor(im) * 2 - 1 
-        return t
-    except Exception:
-        return None
+#     print(f"Dataset split complete. {len(train_files)} training images, {len(test_files)} test images.")
 
-# ----------------- small DDPM schedule -----------------
-betas = torch.linspace(1e-4, 2e-2, cfg.T).to(cfg.device)
-alphas = 1 - betas
-alphas_cum = torch.cumprod(alphas, dim=0)
-sqrt_ac = torch.sqrt(alphas_cum); sqrt_1mac = torch.sqrt(1 - alphas_cum)
-def q_sample(x0, t, noise=None):
-    if noise is None: noise = torch.randn_like(x0)
-    a = sqrt_ac[t].view(-1,1,1,1); b = sqrt_1mac[t].view(-1,1,1,1)
-    return a * x0 + b * noise
+# source_dir = "images_downloaded"
+# train_dir = "data/train/"
+# test_dir = "data/test/"
 
-# ----------------- sampling (simple DDPM reverse) -----------------
-@torch.no_grad()
-def sample_model(model, toks, shape, guidance=1.0):
-    B = shape[0]
-    x = torch.randn(shape, device=cfg.device)
-    for i in reversed(range(cfg.T)):
-        t = torch.full((B,), i, device=cfg.device, dtype=torch.long)
+# split_dataset(source_dir, train_dir, test_dir)
 
-        if guidance != 1.0:
-            # classifier-free guidance: concat null + conditioned
-            null = torch.full_like(toks, tok.pad_token_id) 
-            xin = torch.cat([x, x], dim=0)            # [2B, C, H, W]
-            tin = torch.cat([null, toks], dim=0)      # [2B, L]
-            tinc = torch.full((B*2,), i, device=cfg.device, dtype=torch.long)  # repeat t
-            eps = model(xin, tin, tinc)               # now pass t
-            eps = eps.chunk(2, 0)
-            eps = eps[0] + guidance * (eps[1] - eps[0])
-        else:
-            # no guidance
-            eps = model(x, toks, t)                   # pass t here too
+##### train 
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision
+from torchvision import transforms
+# from model import Encoder, Decoder
 
-        beta = betas[i]; a = alphas[i]; ac = alphas_cum[i]
-        z = torch.randn_like(x) if i > 0 else torch.zeros_like(x)
-        # DDPM reverse update (same as you had)
-        x = (1.0 / math.sqrt(a)) * (x - (beta / math.sqrt(1.0 - ac)) * eps) + math.sqrt(beta) * z
+# Device configuration
+device = torch.device('cuda')
 
-    return x
+# Hyperparameters
+num_epochs = 10
+learning_rate = 3e-6
+beta = 0.00003
+
+batch_size = 8
+from torchvision import transforms
+
+to_tensor = transforms.ToTensor()
+
+class TextImageDataset(Dataset):
+    def __init__(self, images_dir, json_path, transform=None):
+        self.images_dir = images_dir
+        self.transform = transform
+
+        with open(json_path, "r", encoding="utf-8") as f:
+            self.descriptions = json.load(f)
+
+        self.image_files = sorted([f for f in os.listdir(images_dir) if f.lower().endswith(('.jpg','.jpeg','.png'))])
+
+    def __len__(self):
+        return len(self.image_files)
+
+    def __getitem__(self, idx):
+        image_name = self.image_files[idx]
+        image_path = os.path.join(self.images_dir, image_name)
+        image = Image.open(image_path).convert("RGB")
+        
+        if self.transform:
+            image = self.transform(image)
+
+        key = os.path.splitext(image_name)[0]
+        description = self.descriptions.get(key, "")
+        return image, description
+
+transform = transforms.Compose([
+    transforms.Resize((256, 256)),
+    transforms.ToTensor(),
+    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+])
+
+dataset = TextImageDataset("all_images", "captions.json", transform=transform)
+dataloader = DataLoader(
+    dataset,
+    batch_size=batch_size,
+    shuffle=True,
+    num_workers=0,     
+)
 
 
-# ----------------- model + optimizer -----------------
-net = Model().to(cfg.device)
-def init_weights(m):
-    if isinstance(m, nn.Conv2d):
-        nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-        if m.bias is not None:
-            nn.init.constant_(m.bias, 0)
-    elif isinstance(m, nn.BatchNorm2d):
-        if m.weight is not None:
-            nn.init.constant_(m.weight, 1)
-        if m.bias is not None:
-            nn.init.constant_(m.bias, 0)
-    elif isinstance(m, nn.Linear):
-        nn.init.xavier_normal_(m.weight)
-        if m.bias is not None:
-            nn.init.constant_(m.bias, 0)
+model = VAE().to(device)
+state = torch.load("checkpoint/old-2.pth", map_location=device)
+from collections import OrderedDict
 
-# Apply to model
-net.apply(init_weights)
+new_state = OrderedDict()
+for k, v in state.items():
+    new_state[k.replace("module.", "")] = v
+
+model.load_state_dict(new_state, strict=True)
+
+if torch.cuda.device_count() > 1:
+    print(f"Using {torch.cuda.device_count()} GPUs")
+    model = nn.DataParallel(model)
+
 decay, no_decay = [], []
-for n, p in net.named_parameters():
+for n, p in model.named_parameters():
     if not p.requires_grad:
         continue
     if n.endswith(".bias") or "norm" in n.lower() or "groupnorm" in n.lower() or "embedding" in n.lower():
@@ -129,133 +122,69 @@ for n, p in net.named_parameters():
 opt = torch.optim.AdamW([
     {"params": decay, "weight_decay": 1e-2},
     {"params": no_decay, "weight_decay": 0.0},
-], lr=cfg.lr, betas=(0.9, 0.95), eps=1e-8)
+], lr=learning_rate, betas=(0.9, 0.95), eps=1e-8)
 
 mse = nn.MSELoss()
-ema = EMA(net, decay=0.9999, device=None)
+ema = EMA(model, decay=0.9999, device=None)
+
+# Add these hyperparameters
+accumulation_steps = 4  # Adjust as needed
+effective_batch_size = batch_size * accumulation_steps
+
+train_losses = []
+scaler = torch.cuda.amp.GradScaler()
+
+# training loop
+for epoch in range(num_epochs):
+    model.train()
+    train_loss = 0
+    for i, (images, _) in enumerate(dataloader):
+        images = images.to(device)
+
+        # Forward pass
+        with torch.cuda.amp.autocast(dtype=torch.float16):
+            reconstructed, encoded = model(images)
+    
+            # Compute loss
+            recon_loss = nn.MSELoss()(reconstructed, images)
+    
+            # Extract mean and log_variance from encoded
+            mean, log_variance = torch.chunk(encoded.float(), 2, dim=1)
+            kl_div = -0.5 * torch.sum(1 + log_variance - mean.pow(2) - log_variance.exp())
+            loss = recon_loss + beta * kl_div
+    
+            # Normalize the loss to account for accumulation
+            loss = loss / accumulation_steps
+
+        # Backward pass
+        scaler.scale(loss).backward()
+
+        if (i + 1) % accumulation_steps == 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) 
+            scaler.step(opt) 
+            scaler.update() 
+            opt.zero_grad(set_to_none=True) 
+            ema.update(model)
+
+        train_loss += loss.item() * accumulation_steps
+
+        print(f'Epoch [{epoch+1}/{num_epochs}], Step [{i+1}/{len(dataloader)}], '
+              f'Loss: {loss.item()*accumulation_steps:.4f}, Recon Loss: {recon_loss.item():.4f}, KL Div: {kl_div.item():.4f}')
 
 
-# ----------------- stream dataset iterator (light heuristic) -----------------
-dataset = load_dataset(cfg.dataset, split="train")
-cfg.steps=len(dataset)//cfg.batch
-def iter_pairs_chunked(dataset, max_workers=8, chunk_size=cfg.chunk_size):
-    """
-    Concurrent image downloader that preloads images in chunks.
-    Uses a persistent ThreadPoolExecutor for efficiency.
-    """
-    def fetch_worker(e):
-        img = fetch_image(e["image_url"])  # must return a tensor or None
-        return img, e["caption"]
+        if i % 150 ==0:
+            with torch.no_grad():
+                # Take the first image from the batch
+                sample_image = images[0].unsqueeze(0)
+                sample_reconstructed = model(sample_image)[0]
+    
+                sample_image = (sample_image * 0.5) + 0.5
+                sample_reconstructed = (sample_reconstructed * 0.5) + 0.5
+    
+                torchvision.utils.save_image(sample_reconstructed, 'reconstructed.png')
 
-    dataset_iter = iter(dataset)
-    total_downloaded = 0
+    train_losses.append(train_loss / len(dataloader))
+  # Save the model checkpoint
+    torch.save(model.state_dict(), f'checkpoint/vae_model_epoch_{epoch+1}.pth')
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        while True:
-            batch_ex = list(islice(dataset_iter, chunk_size))
-            if not batch_ex:
-                break
-
-            futures = [executor.submit(fetch_worker, ex) for ex in batch_ex]
-            preloaded_imgs, preloaded_texts = [], []
-
-            for fut in tqdm(as_completed(futures), total=len(futures), desc="Chunk loading"):
-                try:
-                    img, cap = fut.result()
-                    if img is not None:
-                        preloaded_imgs.append(img)
-                        preloaded_texts.append(cap)
-                        total_downloaded += 1
-                except Exception as e:
-                    print("⚠️ fetch failed:", e)
-
-            yield preloaded_imgs, preloaded_texts, total_downloaded
-
-
-# ----------------- training loop using chunked download -----------------
-pbar = tqdm(total=cfg.steps)
-step = 0
-net.train()
-
-losses = []
-scaler = torch.cuda.amp.GradScaler()  # initialize once before training
-
-for epoch in range(cfg.epoch):
-    print(f"=== Epoch {epoch+1}/{cfg.epoch} ===")
-    for imgs_chunk, texts_chunk, downloaded_so_far in iter_pairs_chunked(dataset):
-        print(f"Total images downloaded so far: {downloaded_so_far}")
-
-        for i in range(0, len(imgs_chunk), cfg.batch):
-            x0 = torch.stack(imgs_chunk[i:i+cfg.batch], dim=0).to(cfg.device)
-            toks = tokenize_batch(texts_chunk[i:i+cfg.batch])
-
-            t = torch.randint(0, cfg.T, (x0.size(0),), device=cfg.device).long()
-            noise = torch.randn_like(x0)
-            xt = q_sample(x0, t, noise=noise)
-
-            # ✅ use autocast for forward + loss in FP16
-            with torch.cuda.amp.autocast(dtype=torch.float16):
-                pred = net(xt, toks, t)
-                loss = mse(pred, noise) / cfg.accum_steps
-
-            # ✅ scale the loss before backward
-            scaler.scale(loss).backward()
-
-            if (step + 1) % cfg.accum_steps == 0:
-                torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
-
-                # ✅ unscale + optimizer step safely
-                scaler.step(opt)
-                scaler.update()
-                opt.zero_grad(set_to_none=True)
-
-                ema.update(net)
-
-            step += 1
-            pbar.update(1)
-
-            # --- logging and preview as before ---
-            if step % cfg.log_every == 0:
-                true_loss = loss.item() * cfg.accum_steps
-                print(f"[step {step}] loss={true_loss:.4f}")
-                losses.append((step, true_loss))
-
-                with torch.no_grad():
-                    print("noise mean/std:", noise.mean().item(), noise.std().item())
-                    print("pred mean/std:", pred.mean().item(), pred.std().item())
-                    print("batch mse:", F.mse_loss(pred, noise).item(), "baseline zero-predict:", (noise**2).mean().item())
-
-                plt.figure(figsize=(6,4))
-                steps_arr, loss_arr = zip(*losses)
-                plt.plot(steps_arr, loss_arr, marker='o')
-                plt.xlabel("Step")
-                plt.ylabel("Loss")
-                plt.title("Training Loss Curve")
-                plt.grid(True)
-                plt.tight_layout()
-                plt.savefig(os.path.join(cfg.out_dir, "loss_curve.png"))
-                plt.close()
-
-            if step % cfg.save_every == 0:
-                net.eval()
-                with torch.no_grad():
-                    prompts = ["a red car", "a cat portrait", "a person standing in front of a building"]
-                    toks_s = tokenize_batch(prompts)
-                    ema.apply_shadow(net)
-                    sampled = sample_model(net, toks_s, (len(prompts), 3, cfg.img_size, cfg.img_size), guidance=1.5)
-                    ema.restore(net)
-                    imgs_out = (sampled.clamp(-1,1)+1)/2
-                    for j, img in enumerate(imgs_out):
-                        TF.to_pil_image(img.cpu()).save(os.path.join(cfg.out_dir, f"step{step}_samp{j}.png"))
-                net.train()
-
-                torch.save({
-                    "model": net.state_dict(),
-                    "ema": ema.state_dict(),
-                    "opt": opt.state_dict(),
-                    "step": step
-                }, f"save/model-{step}.pt")
-
-
-pbar.close()
-print("Training Done.")
+print('Training finished!')

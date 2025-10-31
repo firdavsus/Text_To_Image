@@ -1,28 +1,28 @@
 from VAE import VAE
-from UNET import UNET, TextEncoder
+from new_UNET import UNET
 
-# class Model(nn.Module):
-#     def __init__(self):
-#         super().__init__()
-#         self.text_encoder = TextEncoder()
-#         self.unet = UNET()
-#         self.vae = VAE()
+# # class Model(nn.Module):
+# #     def __init__(self):
+# #         super().__init__()
+# #         self.text_encoder = TextEncoder()
+# #         self.unet = UNET()
+# #         self.vae = VAE()
         
-#         self.vae.eval()
-#         for param in self.vae.parameters():
-#             param.requires_grad = False
+# #         self.vae.eval()
+# #         for param in self.vae.parameters():
+# #             param.requires_grad = False
 
-#     def forward(self, x, text, t):
-#         with torch.no_grad():
-#             z = self.vae.encoder(img)
+# #     def forward(self, x, text, t):
+# #         with torch.no_grad():
+# #             z = self.vae.encoder(img)
         
-#         text_emb = self.text_encoder(text)  
+# #         text_emb = self.text_encoder(text)  
 
-#         unet_work = self.unet(z, text_emb, t)
+# #         unet_work = self.unet(z, text_emb, t)
 
-#         with torch.no_grad():
-#             out = self.vae.decoder(unet_work)  
-#         return out
+# #         with torch.no_grad():
+# #             out = self.vae.decoder(unet_work)  
+# #         return out
 
 import torch
 import torch.nn as nn
@@ -32,7 +32,6 @@ class DiffusionModel(nn.Module):
         super().__init__()
         self.vae = VAE()
         self.unet = UNET()
-        self.text_encoder = TextEncoder()
         self.register_buffer("betas", betas)
         self.register_buffer("alphas", 1 - betas)
         self.register_buffer("alpha_bars", torch.cumprod(1 - betas, dim=0))
@@ -55,23 +54,11 @@ class DiffusionModel(nn.Module):
         # 3️⃣ Add noise to latent
         z_t = torch.sqrt(alpha_bar_t) * z + torch.sqrt(1 - alpha_bar_t) * eps
 
-        # 4️⃣ Encode text
-        text_emb = self.text_encoder(text)
-
         # 5️⃣ UNet predicts the noise
-        pred_eps = self.unet(z_t, text_emb, t)
+        pred_eps = self.unet(z_t, t, text)
 
         # Return prediction and target noise for loss
         return pred_eps, eps
-
-
-
-
-
-
-
-
-
 
 
 # from itertools import islice

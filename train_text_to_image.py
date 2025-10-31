@@ -12,42 +12,47 @@ import matplotlib.pyplot as plt
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from model import DiffusionModel
 from ema import EMA
-from UNET import config
+from new_UNET import config
 from torch.utils.data import Dataset
 from torchvision import transforms
 import os
 import json
 from PIL import Image
 from torch.utils.data import DataLoader
-
+from transformers import BertTokenizer
+import os
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 # ----------------- CONFIG -----------------
 class CFG:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    lr = 1e-4
-    T = 500
+    lr =5e-5
+    T = 250
     log_every = 100
-    save_every = 1000
-    batch_size = 8
+    save_every = 500
+    batch_size = 16
     out_dir = "samples"
     max_len = config.max_len
-    img_size = config.img_size
+    img_size = config.image_size
     dataset = "conceptual_captions"
-    accum_steps=4
-    epoch=10
+    accum_steps=1
+    epoch=30
 
 cfg = CFG()
 os.makedirs(cfg.out_dir, exist_ok=True)
 
 # ----------------- tokenizer (BPE: GPT-2) -----------------
-tok = AutoTokenizer.from_pretrained("gpt2")
-if tok.pad_token is None:
-    tok.pad_token = tok.eos_token
 
+name = config.model_bert
+tok = BertTokenizer.from_pretrained(name)
+# ensure pad token exists
+if tok.pad_token is None:
+    tok.add_special_tokens({"pad_token": "[PAD]"})
 config.vocab_size = tok.vocab_size
 
 def tokenize_batch(texts):
     out = tok(texts, padding="max_length", truncation=True, max_length=cfg.max_len, return_tensors="pt")
     return out["input_ids"].to(cfg.device)
+
 
 # ----------------- small DDPM schedule -----------------
 betas = torch.linspace(1e-4, 2e-2, cfg.T).to(cfg.device)
@@ -66,48 +71,59 @@ def sample_model(model, toks, steps=None, guidance=1.0, device="cuda"):
     B = toks.size(0)
     toks = toks.to(device)
 
-    latent_shape = (B, 4, 32, 32)
-    z = torch.randn(latent_shape, device=device)  # standard Gaussian
-    z *= 0.18215  # scale matches training latent
+    # infer latent shape + scale from vae
+    with torch.no_grad():
+        example = torch.zeros(1, 3, 256, 256, device=device)
+        z_example = model.vae.encoder(example)
+        latent_shape = (B, z_example.size(1), z_example.size(2), z_example.size(3))
+        latent_std = float(z_example.std().clamp(min=1e-4).item())
 
+    # init latent noise with similar std
+    z = torch.randn(latent_shape, device=device) * latent_std
+
+    # schedule
+    betas = model.betas.to(device)
+    alphas = model.alphas.to(device)
+    alpha_bars = model.alpha_bars.to(device)
     if steps is None:
-        steps = model.betas.size(0)
+        steps = betas.size(0)
 
-    betas = model.betas
-    alphas = model.alphas
-    alpha_bars = model.alpha_bars
-
-    text_emb = model.text_encoder(toks).float()
+    # prepare unconditional tokens for classifier-free guidance
     if guidance != 1.0:
-        empty_toks = torch.full_like(toks, fill_value=tok.pad_token_id)
-        text_emb_uncond = model.text_encoder(empty_toks).float()
+        empty_toks = torch.full_like(toks, fill_value=tok.pad_token_id).to(device)
 
-    timesteps = torch.arange(steps-1, -1, -1, device=device)
-
-    for t in timesteps:
+    # sampling loop (UNet expects (x, t, text) per your code)
+    for t in range(steps - 1, -1, -1):
         t_batch = torch.full((B,), t, device=device, dtype=torch.long)
 
-        eps = model.unet(z, text_emb, t_batch)
+        eps = model.unet(z, t_batch, toks)
         if guidance != 1.0:
-            eps_uncond = model.unet(z, text_emb_uncond, t_batch)
+            eps_uncond = model.unet(z, t_batch, empty_toks)
             eps = eps_uncond + guidance * (eps - eps_uncond)
 
         alpha = alphas[t]
         alpha_bar = alpha_bars[t]
         beta = betas[t]
 
-        z = (1 / torch.sqrt(alpha)) * (z - (beta / torch.sqrt(1 - alpha_bar)) * eps)
+        z = (1.0 / torch.sqrt(alpha)) * (z - (beta / torch.sqrt(1.0 - alpha_bar)) * eps)
         if t > 0:
-            z += torch.sqrt(beta) * torch.randn_like(z)
+            z = z + torch.sqrt(beta) * torch.randn_like(z)
 
-    # Decode latent
-    img = model.vae.decoder(z)
+    # decode
+    img = model.vae.decoder(z)   # decoder expects same latent shape as encoder output
     return img.clamp(-1, 1)
 
 
+
+
+
 # ----------------- model + optimizer -----------------
+# ckpt = torch.load("save/model-55000.pt", map_location=cfg.device)
+
 net = DiffusionModel(betas).to(cfg.device)
-state = torch.load("checkpoint/old-2.pth", map_location=cfg.device)
+# net.load_state_dict(ckpt["model"], strict=True)
+
+state = torch.load("checkpoint/vae_model_epoch_1.pth", map_location=cfg.device)
 from collections import OrderedDict
 
 new_state = OrderedDict()
@@ -173,7 +189,6 @@ transform = transforms.Compose([
 ])
 
 dataset = TextImageDataset("all_images", "captions.json", transform=transform)
-dataloader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=True, num_workers=0)
 
 # ----------------- training loop using chunked download -----------------
 pbar = tqdm(total=len(dataset))
@@ -185,13 +200,14 @@ scaler = torch.cuda.amp.GradScaler()  # initialize once before training
 
 for epoch in range(cfg.epoch):
     print(f"=== Epoch {epoch+1}/{cfg.epoch} ===")
+    dataloader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=True, num_workers=0)
     for i, (images, captions) in enumerate(dataloader):
         x0 = images.to(cfg.device)
         toks = tokenize_batch(captions)
 
         t = torch.randint(0, cfg.T, (x0.size(0),), device=cfg.device).long()
 
-        with torch.cuda.amp.autocast(dtype=torch.float16):
+        with torch.amp.autocast(dtype=torch.float16, device_type=cfg.device.type):
             pred_eps, target_eps = net(x0, toks, t)
 
             loss = mse(pred_eps, target_eps) / cfg.accum_steps

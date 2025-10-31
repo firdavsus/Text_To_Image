@@ -48,10 +48,10 @@ device = torch.device('cuda')
 
 # Hyperparameters
 num_epochs = 10
-learning_rate = 3e-6
-beta = 0.00003
+learning_rate = 5e-6
+beta = 0.0001
 
-batch_size = 8
+batch_size = 2
 from torchvision import transforms
 
 to_tensor = transforms.ToTensor()
@@ -91,13 +91,13 @@ dataset = TextImageDataset("all_images", "captions.json", transform=transform)
 dataloader = DataLoader(
     dataset,
     batch_size=batch_size,
-    shuffle=True,
+    shuffle=False,
     num_workers=0,     
 )
 
 
 model = VAE().to(device)
-state = torch.load("checkpoint/old-2.pth", map_location=device)
+state = torch.load("checkpoint/vae_model_epoch_1.pth", map_location=device)
 from collections import OrderedDict
 
 new_state = OrderedDict()
@@ -106,9 +106,9 @@ for k, v in state.items():
 
 model.load_state_dict(new_state, strict=True)
 
-if torch.cuda.device_count() > 1:
-    print(f"Using {torch.cuda.device_count()} GPUs")
-    model = nn.DataParallel(model)
+# if torch.cuda.device_count() > 1:
+#     print(f"Using {torch.cuda.device_count()} GPUs")
+#     model = nn.DataParallel(model)
 
 decay, no_decay = [], []
 for n, p in model.named_parameters():
@@ -118,9 +118,9 @@ for n, p in model.named_parameters():
         no_decay.append(p)
     else:
         decay.append(p)
-
+ 
 opt = torch.optim.AdamW([
-    {"params": decay, "weight_decay": 1e-2},
+    {"params": decay, "weight_decay": 1e-3},
     {"params": no_decay, "weight_decay": 0.0},
 ], lr=learning_rate, betas=(0.9, 0.95), eps=1e-8)
 
@@ -128,7 +128,7 @@ mse = nn.MSELoss()
 ema = EMA(model, decay=0.9999, device=None)
 
 # Add these hyperparameters
-accumulation_steps = 4  # Adjust as needed
+accumulation_steps = 32  # Adjust as needed
 effective_batch_size = batch_size * accumulation_steps
 
 train_losses = []
@@ -172,7 +172,7 @@ for epoch in range(num_epochs):
               f'Loss: {loss.item()*accumulation_steps:.4f}, Recon Loss: {recon_loss.item():.4f}, KL Div: {kl_div.item():.4f}')
 
 
-        if i % 150 ==0:
+        if i % 500 == 0:
             with torch.no_grad():
                 # Take the first image from the batch
                 sample_image = images[0].unsqueeze(0)
@@ -182,9 +182,8 @@ for epoch in range(num_epochs):
                 sample_reconstructed = (sample_reconstructed * 0.5) + 0.5
     
                 torchvision.utils.save_image(sample_reconstructed, 'reconstructed.png')
+                torch.save(model.state_dict(), f'checkpoint/vae_model_epoch_{epoch+1}.pth')
 
     train_losses.append(train_loss / len(dataloader))
-  # Save the model checkpoint
-    torch.save(model.state_dict(), f'checkpoint/vae_model_epoch_{epoch+1}.pth')
 
 print('Training finished!')

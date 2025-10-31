@@ -9,18 +9,19 @@ import math
 #  CONFIG
 # ==============================
 class Config:
-    vocab_size = 100
+    vocab_size = 50000
     emb_size = 512
-    max_len = 512
-    num_heads = 16
-    num_layers = 12
+    max_len = 128
+    num_heads = 8
+    num_layers = 6
     dropout = 0.1
     in_channels = 4
     out_channels = 4
     img_size = 32
     time_emb_dim = 512
-    features = [64, 128, 256]
-    cross_attention_levels = [1, 2]
+    features = [128,256,512,512]
+    cross_attention_levels = [1, 2, 3]
+    num_of_bottlenecks=2
 
 
 config = Config()
@@ -325,8 +326,10 @@ class UNET(nn.Module):
             in_ch = out_ch
 
         last_feat = config.features[-1]
-        self.bottleneck = TransformerBottleneck(in_ch=last_feat, out_ch=last_feat, emb_dim=config.emb_size, max_img_size=config.img_size)
-
+        self.bottlenecks = nn.ModuleList([
+            TransformerBottleneck(in_ch=last_feat, out_ch=last_feat, emb_dim=config.emb_size, max_img_size=config.img_size)
+            for _ in range(config.num_of_bottlenecks)  # stack 2 bottlenecks
+        ])
 
         # ----- постройка ups: прямо len(channels)-1 блоков, чтобы восстановить разрешение -----
         self.ups = nn.ModuleList()
@@ -367,7 +370,8 @@ class UNET(nn.Module):
 
             x = down.downsample(x_conv)
 
-        x = self.bottleneck(x, text_emb, t_emb)
+        for bottleneck in self.bottlenecks:
+            x = bottleneck(x, text_emb, t_emb)
 
         for up in self.ups:
             skip = skips.pop()

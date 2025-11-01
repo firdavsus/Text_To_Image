@@ -1,60 +1,43 @@
-import torch
-from torch import nn
-from torch.nn import functional as F
-import math
-import os
-import shutil
-from sklearn.model_selection import train_test_split
-from VAE import VAE
-from ema import EMA
+from torchvision import transforms
 from torch.utils.data import Dataset
+from torch.utils.data import DataLoader
+from PIL import Image
+import torch
 import os
 import json
-from PIL import Image
-from torch.utils.data import DataLoader
+import lpips
+import torch.nn.functional as F
+from tqdm import tqdm
 
-# def split_dataset(source_dir, train_dir, test_dir, test_size=0.1, random_state=42):
-#     image_files = [f for f in os.listdir(source_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+from model import Transformer, config
 
-#     train_files, test_files = train_test_split(image_files, test_size=test_size, random_state=random_state)
+#### some configs
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+batch_size = 64
+accum_steps = 1
+num_epochs = 30
+learning_rate = 2e-4
+save_each = 500
+#### end of params
 
-#     os.makedirs(train_dir, exist_ok=True)
-#     os.makedirs(test_dir, exist_ok=True)
 
-#     for file in train_files:
-#         shutil.copy(os.path.join(source_dir, file), os.path.join(train_dir, file))
+#### tokenizer
+from transformers import GPT2Tokenizer
+tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+tokenizer.pad_token = tokenizer.eos_token
+config.vocab_size = len(tokenizer)
 
-#     for file in test_files:
-#         shutil.copy(os.path.join(source_dir, file), os.path.join(test_dir, file))
-
-#     print(f"Dataset split complete. {len(train_files)} training images, {len(test_files)} test images.")
-
-# source_dir = "images_downloaded"
-# train_dir = "data/train/"
-# test_dir = "data/test/"
-
-# split_dataset(source_dir, train_dir, test_dir)
-
-##### train 
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import torchvision
-from torchvision import transforms
-# from model import Encoder, Decoder
-
-# Device configuration
-device = torch.device('cuda')
-
-# Hyperparameters
-num_epochs = 10
-learning_rate = 5e-6
-beta = 0.0001
-
-batch_size = 2
-from torchvision import transforms
-
-to_tensor = transforms.ToTensor()
+def tokenize_texts(texts, max_len=config.max_text_len, device="cpu"):
+    encoded = tokenizer(
+        texts,
+        padding="max_length",
+        truncation=True,
+        max_length=max_len,
+        return_tensors="pt"
+    )
+    input_ids = encoded.input_ids.to(device)   
+    attention_mask = encoded.attention_mask.to(device)  
+    return input_ids, attention_mask
 
 class TextImageDataset(Dataset):
     def __init__(self, images_dir, json_path, transform=None):
@@ -64,7 +47,7 @@ class TextImageDataset(Dataset):
         with open(json_path, "r", encoding="utf-8") as f:
             self.descriptions = json.load(f)
 
-        self.image_files = sorted([f for f in os.listdir(images_dir) if f.lower().endswith(('.jpg','.jpeg','.png'))])
+        self.image_files = sorted([f for f in os.listdir(images_dir) if f.lower().endswith(('.jpg','.jpeg','.png', '.PNG', '.webp'))])
 
     def __len__(self):
         return len(self.image_files)
@@ -87,103 +70,82 @@ transform = transforms.Compose([
     transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
 ])
 
-dataset = TextImageDataset("all_images", "captions.json", transform=transform)
-dataloader = DataLoader(
-    dataset,
-    batch_size=batch_size,
-    shuffle=False,
-    num_workers=0,     
-)
+dataset = TextImageDataset("../all_images", "../captions.json", transform=transform)
+
+## for loss
+def reconstruct_from_patches(patches, patch_size=16, grid_size=16):
+    B, T2, C, p, _ = patches.shape
+    assert T2 == grid_size**2, f"Expected T2={grid_size**2}, got {T2}"
+    images = []
+    for b in range(B):
+        rows = []
+        for i in range(grid_size):
+            row_patches = patches[b, i*grid_size:(i+1)*grid_size]  
+            row = torch.cat(list(row_patches), dim=2)
+            rows.append(row)
+        img = torch.cat(rows, dim=1)
+        images.append(img)
+    return torch.stack(images, dim=0)
 
 
-model = VAE().to(device)
-state = torch.load("checkpoint/vae_model_epoch_1.pth", map_location=device)
-from collections import OrderedDict
+## training
+model = Transformer().to(device)
+# model.load_state_dict(torch.load("model-1.pth"))
 
-new_state = OrderedDict()
-for k, v in state.items():
-    new_state[k.replace("module.", "")] = v
-
-model.load_state_dict(new_state, strict=True)
-
-# if torch.cuda.device_count() > 1:
-#     print(f"Using {torch.cuda.device_count()} GPUs")
-#     model = nn.DataParallel(model)
-
-decay, no_decay = [], []
-for n, p in model.named_parameters():
-    if not p.requires_grad:
-        continue
-    if n.endswith(".bias") or "norm" in n.lower() or "groupnorm" in n.lower() or "embedding" in n.lower():
-        no_decay.append(p)
-    else:
-        decay.append(p)
- 
-opt = torch.optim.AdamW([
-    {"params": decay, "weight_decay": 1e-3},
-    {"params": no_decay, "weight_decay": 0.0},
-], lr=learning_rate, betas=(0.9, 0.95), eps=1e-8)
-
-mse = nn.MSELoss()
-ema = EMA(model, decay=0.9999, device=None)
-
-# Add these hyperparameters
-accumulation_steps = 32  # Adjust as needed
-effective_batch_size = batch_size * accumulation_steps
-
-train_losses = []
 scaler = torch.cuda.amp.GradScaler()
+opt = torch.optim.AdamW(
+    model.parameters(),
+    lr=learning_rate,           # slightly higher LR for faster convergence
+    betas=(0.9, 0.98), # stable for transformers
+    eps=1e-8,
+    weight_decay=0.01  # helps regularize medium-large model
+)
+lpips_loss_fn = lpips.LPIPS(net='alex').to(device)
 
-# training loop
 for epoch in range(num_epochs):
     model.train()
     train_loss = 0
-    for i, (images, _) in enumerate(dataloader):
+    opt.zero_grad()
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,     
+    )
+
+    pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}", leave=True)
+    
+    for step, (images, texts) in enumerate(pbar):
         images = images.to(device)
+        text_ids, _ = tokenize_texts(texts, max_len=config.max_text_len, device=device)
 
-        # Forward pass
-        with torch.cuda.amp.autocast(dtype=torch.float16):
-            reconstructed, encoded = model(images)
-    
-            # Compute loss
-            recon_loss = nn.MSELoss()(reconstructed, images)
-    
-            # Extract mean and log_variance from encoded
-            mean, log_variance = torch.chunk(encoded.float(), 2, dim=1)
-            kl_div = -0.5 * torch.sum(1 + log_variance - mean.pow(2) - log_variance.exp())
-            loss = recon_loss + beta * kl_div
-    
-            # Normalize the loss to account for accumulation
-            loss = loss / accumulation_steps
+        with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+            image_preds = model(text_ids, images) 
+            pred_full = reconstruct_from_patches(image_preds, patch_size=16, grid_size=16)
 
-        # Backward pass
+            loss_l1 = F.l1_loss(pred_full, images)
+
+        loss_lpips = lpips_loss_fn(pred_full.float(), images.float()).mean()
+
+        loss = loss_l1 + 0.15 * loss_lpips
+        loss = loss / accum_steps   
+
         scaler.scale(loss).backward()
 
-        if (i + 1) % accumulation_steps == 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) 
-            scaler.step(opt) 
-            scaler.update() 
-            opt.zero_grad(set_to_none=True) 
-            ema.update(model)
+        train_loss += (loss.item() * accum_steps)
 
-        train_loss += loss.item() * accumulation_steps
+        if (step + 1) % accum_steps == 0 or (step + 1) == len(dataloader):
+            # unscale, clip, step, update scaler
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(opt)
+            scaler.update()
+            opt.zero_grad()
 
-        print(f'Epoch [{epoch+1}/{num_epochs}], Step [{i+1}/{len(dataloader)}], '
-              f'Loss: {loss.item()*accumulation_steps:.4f}, Recon Loss: {recon_loss.item():.4f}, KL Div: {kl_div.item():.4f}')
+        pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
+        if (step + 1) % save_each == 0 or (step + 1) == len(dataloader):
+            torch.save(model.state_dict(), f"model-{epoch+1}.pth")
 
-        if i % 500 == 0:
-            with torch.no_grad():
-                # Take the first image from the batch
-                sample_image = images[0].unsqueeze(0)
-                sample_reconstructed = model(sample_image)[0]
-    
-                sample_image = (sample_image * 0.5) + 0.5
-                sample_reconstructed = (sample_reconstructed * 0.5) + 0.5
-    
-                torchvision.utils.save_image(sample_reconstructed, 'reconstructed.png')
-                torch.save(model.state_dict(), f'checkpoint/vae_model_epoch_{epoch+1}.pth')
+    print(f"Epoch {epoch+1}/{num_epochs}, Loss: {train_loss / len(dataloader):.4f}")
 
-    train_losses.append(train_loss / len(dataloader))
-
-print('Training finished!')

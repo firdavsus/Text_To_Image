@@ -1,202 +1,248 @@
-from VAE import VAE
-from new_UNET import UNET
-
-# # class Model(nn.Module):
-# #     def __init__(self):
-# #         super().__init__()
-# #         self.text_encoder = TextEncoder()
-# #         self.unet = UNET()
-# #         self.vae = VAE()
-        
-# #         self.vae.eval()
-# #         for param in self.vae.parameters():
-# #             param.requires_grad = False
-
-# #     def forward(self, x, text, t):
-# #         with torch.no_grad():
-# #             z = self.vae.encoder(img)
-        
-# #         text_emb = self.text_encoder(text)  
-
-# #         unet_work = self.unet(z, text_emb, t)
-
-# #         with torch.no_grad():
-# #             out = self.vae.decoder(unet_work)  
-# #         return out
 
 import torch
 import torch.nn as nn
+import math
 
-class DiffusionModel(nn.Module):
-    def __init__(self, betas):
+class Config:
+    num_layers=16
+    num_heads=24
+    emb_size = 768
+    image_size = 256
+    patches = 16
+    grid_size = 16
+    ff_hidden_mult = 8
+    max_text_len = 256
+    max_image_len = 256
+    dropout=0.2
+    vocab_size = 50000
+
+config = Config()
+
+class Attention(nn.Module):
+    def __init__(self, in_dim, out_dim):
         super().__init__()
-        self.vae = VAE()
-        self.unet = UNET()
-        self.register_buffer("betas", betas)
-        self.register_buffer("alphas", 1 - betas)
-        self.register_buffer("alpha_bars", torch.cumprod(1 - betas, dim=0))
+        self.Q = nn.Linear(in_dim, out_dim, bias=False)
+        self.K = nn.Linear(in_dim, out_dim, bias=False)
+        self.V = nn.Linear(in_dim, out_dim, bias=False)
 
-        # Freeze VAE
-        self.vae.eval()
-        for p in self.vae.parameters():
-            p.requires_grad = False
+        self.softmax = nn.Softmax(dim=-1)
 
-    def forward(self, images, text, t):
-        with torch.no_grad():
-            z = self.vae.encoder(images) 
+    def forward(self, x, mask=None):
+        Q = self.Q(x)  # [B, seq, d]
+        K = self.K(x)
+        V = self.V(x)
 
-        # 2️⃣ Sample noise
-        eps = torch.randn_like(z)
+        d_k = Q.shape[-1]
+        seq_len = Q.size(1)
 
-        # Get corresponding alpha_bar for each t
-        alpha_bar_t = self.alpha_bars[t].view(-1, 1, 1, 1)  # [B,1,1,1]
+        # Q @ Kᵀ  (ты использовал Q@Qᵀ — это баг, мы это исправляем)
+        attention_score = (Q @ K.transpose(-2, -1)) / math.sqrt(d_k)  # [B, seq, seq]
 
-        # 3️⃣ Add noise to latent
-        z_t = torch.sqrt(alpha_bar_t) * z + torch.sqrt(1 - alpha_bar_t) * eps
+        if mask is not None:
+            # Приводим mask к [B, 1, seq, seq] или хотя бы к совместимому размеру
+            if mask.dim() == 4:
+                mask = mask[:, :, :seq_len, :seq_len]
+                # Сжимаем для совместимости: [B,1,seq,seq] -> [B,seq,seq]
+                mask = mask.squeeze(1).squeeze(1)
+            mask = mask.bool() 
+            attention_score = attention_score.masked_fill(~mask, float('-1e-6'))
 
-        # 5️⃣ UNet predicts the noise
-        pred_eps = self.unet(z_t, t, text)
+        probs = self.softmax(attention_score)
+        output = probs @ V  # [B, seq, d]
 
-        # Return prediction and target noise for loss
-        return pred_eps, eps
+        return output
 
+class MLA(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.in_dim = config.emb_size
+        self.heads = config.num_heads
 
-# from itertools import islice
-# import os
-# import json
-# import asyncio
-# from io import BytesIO
-# from PIL import Image
-# from datasets import load_dataset
-# from tqdm.asyncio import tqdm
-# import aiohttp
-# import aiofiles
-# import async_timeout
+        assert self.in_dim % self.heads == 0
 
-# # ---------------- CONFIG ----------------
-# output_folder = "all_images"
-# captions_file = "captions.json"
-# os.makedirs(output_folder, exist_ok=True)
+        self.for_each_head = self.in_dim // self.heads
 
-# dataset_split = "train"      # or "validation" / "test"
-# max_concurrent = 64          # max simultaneous connections
-# chunk_size = 1024             # process dataset in chunks
-# timeout = 4                   # seconds per request
-# img_size = 256
-# save_every = 25            # save captions periodically
+        self.attn = nn.ModuleList(
+            [Attention(self.for_each_head, self.for_each_head) for _ in range(self.heads)]
+        )
 
-# # ---------------- helpers ----------------
-# async def fetch_image_aio(session, url, size=img_size, timeout=timeout):
-#     """Download and center-crop+resize image asynchronously."""
-#     if not url:
-#         return None
-#     try:
-#         async with async_timeout.timeout(timeout):
-#             async with session.get(url, headers={"User-Agent":"Mozilla/5.0"}) as resp:
-#                 if resp.status != 200:
-#                     return None
-#                 content = await resp.read()
-#                 im = Image.open(BytesIO(content)).convert("RGB")
-#                 W, H = im.size
-#                 m = min(W, H)
-#                 im = im.crop(((W - m)//2, (H - m)//2, (W + m)//2, (H + m)//2)).resize((size, size), Image.BICUBIC)
-#                 return im
-#     except Exception:
-#         return None
+        self.ml_head = nn.Linear(self.in_dim, self.in_dim)
 
-# async def download_worker(session, idx, ex):
-#     """Download single image and return (idx, caption) or None."""
-#     url = ex.get("image_url")
-#     caption = ex.get("caption", "")
-#     if not url:
-#         return None
-#     img = await fetch_image_aio(session, url)
-#     if img is None:
-#         return None
-#     tmp_path = os.path.join(output_folder, f"{idx}.tmp")
-#     final_path = os.path.join(output_folder, f"{idx}.jpg")
-#     try:
-#         img.save(tmp_path, format="JPEG", quality=92)
-#         os.replace(tmp_path, final_path)
-#         return idx, caption
-#     except Exception:
-#         if os.path.exists(tmp_path):
-#             os.remove(tmp_path)
-#         return None
+    def forward(self, embedding, mask=None):
 
-# def chunked_iterable(it, size):
-#     it = iter(it)
-#     while True:
-#         chunk = list(islice(it, size))
-#         if not chunk:
-#             break
-#         yield chunk
+        batch, seq_len, d_emb = embedding.shape
+        
+         # (1 x 64 x 512) --> (1 x 64 x 8 x 64) which means : 
+        # (Batch, seq_len,d_emb) -->(Batch, seq_len, heads, attn_dim)  
+        mha_input = embedding.view(batch, seq_len, self.heads, self.for_each_head)
 
-# # ---------------- resume support ----------------
-# captions = {}
-# downloaded_ids = set()
-# if os.path.exists(captions_file):
-#     try:
-#         with open(captions_file, "r", encoding="utf-8") as f:
-#             captions = json.load(f)
-#         downloaded_ids = set(int(k) for k in captions.keys())
-#         print(f"Resuming: loaded {len(captions)} captions")
-#     except Exception:
-#         captions = {}
-#         downloaded_ids = set()
+        # (batch, seq_len, n_heads, attn_dim) -> (batch, n_heads, seq_len, attn_dim)    
+        mha_input = mha_input.permute(0, 2, 1 ,3) # it divides the embedding to heads
+        if mask is not None:
+            # Ensure [B, seq_len, seq_len] per head
+            mask = mask.squeeze(1)  # [1, seq, seq] -> [seq, seq]
+            mask = mask.expand(batch, seq_len, seq_len)  # [B, seq, seq]
+        
+        outs = [head(mha_input[:, i, :, :], mask=mask) for i, head in enumerate(self.attn)]
+        out = torch.cat(outs, dim=-1)
+        
+        out = self.ml_head(out)
+        
+        return out
+    
 
-# # ---------------- main async downloader ----------------
-# dataset = load_dataset("conceptual_captions", split=dataset_split)
-# dataset_iter = iter(dataset)
-# try:
-#     total_estimate = len(dataset)
-# except Exception:
-#     total_estimate = None
+class Block(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.attention = MLA()
+        self.norm1 = nn.RMSNorm(config.emb_size)
+        self.norm2 = nn.RMSNorm(config.emb_size)
 
-# async def main():
-#     global captions, downloaded_ids
-#     global_idx = 0
-#     pbar = tqdm(total=total_estimate, desc="Attempted", unit="img")
-#     pbar.set_postfix(saved=len(captions), refresh=False)
+        hidden_dim = config.emb_size * config.ff_hidden_mult
+        self.ffn = nn.Sequential(
+            nn.Linear(config.emb_size, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, config.emb_size),
+        )
 
-#     connector = aiohttp.TCPConnector(limit=max_concurrent, ssl=False)
-#     timeout_obj = aiohttp.ClientTimeout(total=None)
-#     async with aiohttp.ClientSession(connector=connector, timeout=timeout_obj) as session:
-#         for chunk in chunked_iterable(dataset_iter, chunk_size):
-#             tasks = []
-#             for i, ex in enumerate(chunk):
-#                 idx = global_idx + i
-#                 if idx in downloaded_ids:
-#                     pbar.update(1)
-#                     continue
-#                 tasks.append(download_worker(session, idx, ex))
+        self.dropout = nn.Dropout(config.dropout)
 
-#             for fut in asyncio.as_completed(tasks):
-#                 res = await fut
-#                 pbar.update(1)
-#                 if res is not None:
-#                     idx_saved, caption = res
-#                     captions[str(idx_saved)] = caption
-#                     downloaded_ids.add(idx_saved)
-#                 if len(captions) % 100 == 0:
-#                     pbar.set_postfix(saved=len(captions), refresh=True)
+    def forward(self, x, mask=None):
+        attn_out = self.attention(x, mask=mask) 
+        x = self.norm1(x + self.dropout(attn_out))
 
-#             global_idx += len(chunk)
+        ffn_out = self.ffn(x)
+        x = self.norm2(x + self.dropout(ffn_out))
 
-#             # periodically save captions
-#             if len(captions) > 0 and len(captions) % save_every == 0:
-#                 print("it is zsaved")
-#                 async with aiofiles.open(captions_file, "w", encoding="utf-8") as f:
-#                     await f.write(json.dumps(captions, ensure_ascii=False))
-#                 pbar.set_postfix(saved=len(captions), refresh=True)
+        return x
+    
+class ConvEncoder(nn.Module):
+    def __init__(self, embedding_dim=config.emb_size):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Conv2d(3, 32, 4, 2, 1),  # 256 -> 128
+            nn.ReLU(),
+            nn.Conv2d(32, 64, 4, 2, 1), # 128 -> 64
+            nn.ReLU(),
+            nn.Conv2d(64, 128, 4, 2, 1), # 64 -> 32
+            nn.ReLU(),
+            nn.Conv2d(128, embedding_dim, 4, 2, 1), # 32 -> 16
+            nn.ReLU(),
+        )
 
-#     # final save
-#     if len(captions) > 0:
-#         async with aiofiles.open(captions_file, "w", encoding="utf-8") as f:
-#             await f.write(json.dumps(captions, ensure_ascii=False))
-#     pbar.close()
-#     print("Done. saved images with captions:", len(captions))
+    def forward(self, x):
+        return self.encoder(x)  
+    
+class ImagePositionalEmbedding(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.row_embed = nn.Embedding(config.image_size, config.emb_size)
+        self.col_embed = nn.Embedding(config.image_size, config.emb_size)
 
-# # ---------------- run ----------------
-# asyncio.run(main())
+    def forward(self, x):
+        # x: [B, C, H, W]
+        B, C, H, W = x.shape
+        device = x.device
+        
+        # row and column indices
+        rows = torch.arange(H, device=device)
+        cols = torch.arange(W, device=device)
+        
+        # embeddings: [H, emb_size] and [W, emb_size]
+        row_emb = self.row_embed(rows)[:, None, :]  # [H,1,emb_size]
+        col_emb = self.col_embed(cols)[None, :, :]  # [1,W,emb_size]
+        
+        # broadcast to [H,W,emb_size] and then add
+        pos_emb = row_emb + col_emb  # [H, W, emb_size]
+        pos_emb = pos_emb.permute(2,0,1).unsqueeze(0).repeat(B,1,1,1)
+        return pos_emb
 
+def make_causal_cond_mask(T_text, T_image, device):
+    # full mask shape: [seq_len, seq_len] bool where True = allowed
+    seq_len = T_text + T_image
+    mask = torch.zeros(seq_len, seq_len, dtype=torch.bool, device=device)
+
+    # text rows: text can see all tokens (text + image)
+    mask[:T_text, :] = True
+
+    # image rows: can see all text tokens
+    mask[T_text:, :T_text] = True
+    # image rows among themselves: causal (lower triangular)
+    img_causal = torch.tril(torch.ones(T_image, T_image, dtype=torch.bool, device=device))
+    mask[T_text:, T_text:] = img_causal
+    # expand to batch/head shape later as needed
+    return mask  # shape [seq_len, seq_len]
+
+class Transformer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # text part
+        self.text_emb = nn.Embedding(config.vocab_size, config.emb_size)
+        self.text_pos = nn.Embedding(config.max_text_len, config.emb_size)
+
+        # image embedder
+        self.image_emb = ConvEncoder(config.emb_size)
+        self.pos_emb_layer = ImagePositionalEmbedding()
+
+        self.text_blocks = nn.ModuleList([Block() for _ in range(config.num_layers)])
+        self.norm = nn.RMSNorm(config.emb_size)
+
+        self.lm_head = nn.Linear(config.emb_size, (config.patches**2) * 3)
+
+    def forward(self, text, images=None):
+        B, T1 = text.shape
+        if images is not None:
+            B, C, H, W = images.shape
+    
+            # Image features -> tokens
+            img_feat = self.image_emb(images)                   # [B, emb, 16, 16]
+            pos_emb = self.pos_emb_layer(img_feat)
+            img_feat = img_feat + pos_emb
+            image_emb = img_feat.flatten(2).transpose(1, 2)     # [B, 256, emb] if 16x16
+    
+            T2 = image_emb.shape[1]  # <-- REAL image token count!
+    
+            # ✅ Build mask for (B, heads, seq_len, seq_len)
+            mask = make_causal_cond_mask(T1, T2, text.device)
+            mask = mask.unsqueeze(0).unsqueeze(1)  # [1, 1, seq, seq]
+    
+            # Embeddings
+            text_positions = torch.arange(T1, device=text.device)
+            text_emb = self.text_emb(text) + self.text_pos(text_positions)
+    
+            seq = torch.cat([text_emb, image_emb], dim=1)
+    
+            for block in self.text_blocks:
+                seq = block(seq, mask=mask)
+    
+            seq = self.norm(seq)
+            image_tokens = seq[:, T1:, :]
+            image_preds = self.lm_head(image_tokens)
+            image_preds = image_preds.view(B, T2, 3, 16, 16)
+    
+            return image_preds
+        else:
+            H = W = config.grid_size *  config.patches
+            T2 = config.grid_size**2
+    
+            # Initialize dummy image tokens with zeros
+            image_emb = torch.zeros(B, T2,  config.emb_size, device=text.device)
+            mask = make_causal_cond_mask(T1, T2, text.device)
+            mask = mask.unsqueeze(0).unsqueeze(1)
+    
+            text_positions = torch.arange(T1, device=text.device)
+            text_emb = self.text_emb(text) + self.text_pos(text_positions)
+    
+            seq = torch.cat([text_emb, image_emb], dim=1)
+    
+            # Pass through transformer blocks autoregressively
+            for block in self.text_blocks:
+                seq = block(seq, mask=mask)
+            seq = self.norm(seq)
+            image_tokens = seq[:, T1:, :]
+            image_preds = self.lm_head(image_tokens)
+            # reshape to full image
+            B, T2, C = image_preds.shape[0], image_preds.shape[1], image_preds.shape[2]
+            image_preds = image_preds.view(B, 3, H, W)  # flatten patches back to full image
+    
+            return image_preds
